@@ -4,8 +4,14 @@ python-multipart>=0.0.9        # multipart/form-data (file upload)
 
 # ORM
 sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0         # PostgreSQL driver
 pydantic>=2.7.0
 pydantic-settings>=2.2.0
+
+# Auth
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+pydantic[email]>=2.7.0         # email validation in auth
 
 # ML (mirrors notebook imports)
 scikit-learn>=1.4.0
@@ -14,3 +20,5 @@ numpy>=1.26.0
 joblib>=1.3.0
 openpyxl>=3.1.0               # read .xlsx
 xlrd>=2.0.1                   # read legacy .xls
+matplotlib>=3.8.0              # heatmap generation
+requests>=2.31.0               # download remote SL files

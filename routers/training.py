@@ -1,11 +1,4 @@
-"""
-POST /train
-  – Upload CSV + external factors JSON → train → persist to DB → return metrics.
 
-The endpoint first hashes the CSV. If the same CSV was uploaded before by
-the same user it reuses the existing Dataset record (no duplicate insert),
-and simply trains a new model under a different name.
-"""
 
 from __future__ import annotations
 
@@ -18,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
+from auth import get_current_user
 from config import settings
 from db.models import Dataset, TrainedModel
 from db.session import get_db
@@ -48,7 +42,6 @@ async def train(
     file: UploadFile = File(..., description="Main financial data (.csv or .xlsx)"),
 
     # ── Form fields ───────────────────────────────────────────────────────────
-    user_id: str = Form(..., description="Caller's user/tenant ID"),
     model_name: str = Form(..., description="Unique name for this trained model"),
     description: Optional[str] = Form(None),
     sheet_name: str = Form("10 SL", description="Excel sheet (ignored for CSV)"),
@@ -64,7 +57,9 @@ async def train(
     ),
 
     db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
+    user_id = str(current_user.id)
     # 1. Read uploaded file
     content = await file.read()
     if not content:

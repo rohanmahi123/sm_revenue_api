@@ -7,6 +7,7 @@ GET /datasets/{dataset_id}/models    – list models trained on this dataset
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from auth import get_current_user
 from db.models import Dataset, TrainedModel
 from db.session import get_db
 from schemas import DatasetResponse, TrainedModelResponse
@@ -20,12 +21,12 @@ router = APIRouter(prefix="/datasets", tags=["Datasets"])
     summary="List all CSV datasets uploaded by a user",
 )
 def list_datasets(
-    user_id: str = Query(..., description="User/tenant ID"),
     db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
     datasets = (
         db.query(Dataset)
-        .filter_by(user_id=user_id)
+        .filter_by(user_id=str(current_user.id))
         .order_by(Dataset.uploaded_at.desc())
         .all()
     )
@@ -42,7 +43,7 @@ def list_datasets(
     response_model=DatasetResponse,
     summary="Get metadata for a single dataset",
 )
-def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
+def get_dataset(dataset_id: int, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     ds = db.query(Dataset).get(dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found.")
@@ -60,7 +61,7 @@ def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
         "before kicking off a new training run."
     ),
 )
-def list_dataset_models(dataset_id: int, db: Session = Depends(get_db)):
+def list_dataset_models(dataset_id: int, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     ds = db.query(Dataset).get(dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found.")

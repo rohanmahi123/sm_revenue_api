@@ -15,6 +15,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from fastapi.security import HTTPBearer
 
 from config import settings
 from db.session import create_tables
@@ -77,6 +79,41 @@ app.include_router(models_router.router)
 
 from routers.forecast_map import router as forecast_map_router
 app.include_router(forecast_map_router)
+
+from routers.heatmap_router import router as heatmap_router
+app.include_router(heatmap_router)
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+        }
+    }
+    for path in schema["paths"].values():
+        for method in path.values():
+            method["security"] = [{"BearerAuth": []}]
+            # Remove the raw "authorization" header field shown per-endpoint
+            if "parameters" in method:
+                method["parameters"] = [
+                    p for p in method["parameters"]
+                    if not (p.get("in") == "header" and
+                            p.get("name", "").lower() == "authorization")
+                ]
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi
+
 
 @app.get("/", tags=["Health"])
 def root():

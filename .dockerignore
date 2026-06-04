@@ -1,0 +1,27 @@
+# Python
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets
+.env
+
+# Local DB (SQLite travels via volume or is recreated)
+sm_revenue.db
+
+# Model store — handled via Docker volume, not baked into image
+model_store/
+
+# Dev/test scripts
+test_*.py
+merge_*.py
+add_id.py
+
+# Git
+.git
+.gitignore
+
+# Docs (optional — remove this line if you want README in image)
+README.md

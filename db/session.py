@@ -7,8 +7,8 @@ from config import settings
 from db.models import Base
 
 engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {},
+    settings.ML_DATABASE_URL,
+    connect_args={"check_same_thread": False} if "sqlite" in settings.ML_DATABASE_URL else {},
     echo=settings.DB_ECHO,
 )
 

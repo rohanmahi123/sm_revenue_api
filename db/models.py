@@ -92,3 +92,29 @@ class TrainedModel(Base):
 
     # Relations
     dataset = relationship("Dataset", back_populates="trained_models")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Processing-pipeline reference models (read-only mirror of the ingestion DB)
+# Used by the batch-based prediction endpoint to locate uploaded SL files.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class IngestionBatch(Base):
+    __tablename__ = "ingestion_batches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, nullable=True)
+    status = Column(String(64), nullable=True)
+
+    file_uploads = relationship("FileUpload", back_populates="batch")
+
+
+class FileUpload(Base):
+    __tablename__ = "file_uploads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("ingestion_batches.id"), nullable=False, index=True)
+    file_type = Column(String(64), nullable=False)   # "SUBLEDGER", "COA", etc.
+    file_path = Column(String(1024), nullable=True)  # local path or storage URL
+
+    batch = relationship("IngestionBatch", back_populates="file_uploads")

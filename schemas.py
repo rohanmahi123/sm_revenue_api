@@ -170,5 +170,110 @@ class PredictResponse(BaseModel):
     model_id: int
     model_name: str
     predictions: List[PredictResponseRow]
-    heatmap_base64: Optional[str] = None   # PNG encoded as base64 — None if < 2 factors given
-    heatmap_note: Optional[str] = None     # explains what the heatmap shows
+    heatmap_base64: Optional[str] = None
+    heatmap_note: Optional[str] = None
+
+
+# ──────────────────────────────────────────────
+# Date-range forecast schemas
+# ──────────────────────────────────────────────
+
+class ForecastRequest(BaseModel):
+    start_date: str = Field(..., description="Forecast start date e.g. '2026-01-01'")
+    end_date: str = Field(..., description="Forecast end date e.g. '2026-12-31'")
+
+    # Cost components applied uniformly to every month (all optional)
+    Region: Optional[str] = None
+    Geo: Optional[str] = None
+    Country: Optional[str] = None
+    Item_type: Optional[str] = None
+    Customer: Optional[str] = None
+    Raw_Material: Optional[float] = None
+    Direct_Labor: Optional[float] = None
+    Freight: Optional[float] = None
+    Storage: Optional[float] = None
+    Packaging: Optional[float] = None
+    Indirect_Labor: Optional[float] = None
+    Rent_Utility: Optional[float] = None
+    Overhead: Optional[float] = None
+
+    # Single external factor snapshot — treated as the latest / constant value
+    CCI: Optional[float] = None
+    CPI: Optional[float] = None
+    Oil: Optional[float] = None
+    GDP: Optional[float] = None
+    Unemployment: Optional[float] = None
+    ROI: Optional[float] = None
+
+
+class MonthlyForecast(BaseModel):
+    month: str                                  # "2026-01"
+    date: str                                   # "2026-01-01"
+    predicted_total_revenue: Optional[float]
+    predicted_COGS: Optional[float]
+    predicted_SGA: Optional[float]
+    model_used_revenue: Optional[str]
+    model_used_COGS: Optional[str]
+    model_used_SGA: Optional[str]
+
+
+class ForecastSummary(BaseModel):
+    total_revenue: float
+    total_COGS: float
+    total_SGA: float
+    months_count: int
+
+
+class ForecastResponse(BaseModel):
+    model_id: int
+    model_name: str
+    start_date: str
+    end_date: str
+    monthly_predictions: List[MonthlyForecast]
+    summary: ForecastSummary
+
+
+# ──────────────────────────────────────────────
+# Batch-based CSV prediction schemas
+# ──────────────────────────────────────────────
+
+class BatchPredictRequest(BaseModel):
+    """
+    Predict using the SUBLEDGER CSV already uploaded for a given batch.
+    The CSV is read from file_uploads.file_path where file_type='SUBLEDGER'.
+    Optional external factors override the CSV values or fill missing columns.
+    """
+    batch_id: int = Field(..., description="Processing batch ID whose SUBLEDGER file to use")
+    CCI: Optional[float] = None
+    CPI: Optional[float] = None
+    Oil: Optional[float] = None
+    GDP: Optional[float] = None
+    Unemployment: Optional[float] = None
+    ROI: Optional[float] = None
+
+
+class BatchPredictRow(BaseModel):
+    order_date: str
+    predicted_total_revenue: Optional[float]
+    predicted_COGS: Optional[float]
+    predicted_SGA: Optional[float]
+    model_used_revenue: Optional[str]
+    model_used_COGS: Optional[str]
+    model_used_SGA: Optional[str]
+
+
+class BatchPredictSummary(BaseModel):
+    total_revenue: float
+    total_COGS: float
+    total_SGA: float
+    row_count: int
+
+
+class BatchPredictResponse(BaseModel):
+    model_id: int
+    model_name: str
+    batch_id: int
+    sl_file_path: str
+    predictions: List[BatchPredictRow]
+    summary: BatchPredictSummary
+    external_factors_info: Optional[str] = None
