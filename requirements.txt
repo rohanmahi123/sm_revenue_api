@@ -18,7 +18,4 @@ scikit-learn>=1.4.0
 pandas>=2.0.0
 numpy>=1.26.0
 joblib>=1.3.0
-openpyxl>=3.1.0               # read .xlsx
-xlrd>=2.0.1                   # read legacy .xls
-matplotlib>=3.8.0              # heatmap generation
 requests>=2.31.0               # download remote SL files

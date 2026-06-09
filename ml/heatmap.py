@@ -11,17 +11,12 @@ Heatmap utilities
 
 from __future__ import annotations
 
-import base64
 import io
 import os
 import pickle
 import re
 from typing import List, Optional
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
 EXTERNAL_FACTORS = ["CCI", "CPI", "Oil", "GDP", "Unemployment", "ROI"]
@@ -109,9 +104,11 @@ def parse_factor_file(content: bytes, filename: str) -> pd.DataFrame:
     """
     suffix = os.path.splitext(filename)[-1].lower()
     if suffix in (".xlsx", ".xls"):
-        raw = pd.read_excel(io.BytesIO(content))
-    else:
-        raw = pd.read_csv(io.BytesIO(content))
+        raise ValueError(
+            f"Excel files (.xlsx/.xls) are not supported. "
+            f"Please convert '{filename}' to CSV and re-upload."
+        )
+    raw = pd.read_csv(io.BytesIO(content))
 
     cols_lower = [str(c).strip().lower() for c in raw.columns]
     col_map = {cl: orig for cl, orig in zip(cols_lower, raw.columns)}
@@ -199,84 +196,10 @@ def load_factor_data(store_dir: str, company_id: int | str) -> Optional[pd.DataF
 # ── Public: generate heatmap ──────────────────────────────────────────────────
 
 def generate_heatmap(input_rows: List[dict]) -> str | None:
-    """
-    Build a correlation heatmap from a list of dicts OR from a DataFrame
-    passed as the only element (internal use).
-
-    Parameters
-    ----------
-    input_rows : list of dicts with keys matching EXTERNAL_FACTORS
-
-    Returns
-    -------
-    base64 PNG string — or None if insufficient data
-    """
-    df = pd.DataFrame(input_rows)
-
-    available = [
-        col for col in EXTERNAL_FACTORS
-        if col in df.columns and df[col].notna().any()
-    ]
-
-    if len(available) < 2:
-        return None
-
-    ext_df = df[available].apply(pd.to_numeric, errors="coerce").dropna(how="all")
-
-    if ext_df.shape[0] < 2:
-        return None
-
-    corr = ext_df.corr()
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    fig.patch.set_facecolor("#1e1e2e")
-    ax.set_facecolor("#1e1e2e")
-
-    n = len(available)
-    cmap = plt.get_cmap("coolwarm")
-    im = ax.imshow(corr.values, cmap=cmap, vmin=-1, vmax=1, aspect="auto")
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.yaxis.set_tick_params(color="white")
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white", fontsize=9)
-    cbar.set_label("Correlation", color="white", fontsize=10)
-
-    ax.set_xticks(range(n))
-    ax.set_yticks(range(n))
-    ax.set_xticklabels(available, rotation=45, ha="right", color="white", fontsize=11)
-    ax.set_yticklabels(available, color="white", fontsize=11)
-
-    for i in range(n):
-        for j in range(n):
-            val = corr.values[i, j]
-            text_color = "white" if abs(val) < 0.7 else "black"
-            ax.text(
-                j, i, f"{val:.2f}",
-                ha="center", va="center",
-                fontsize=10, color=text_color, fontweight="bold",
-            )
-
-    ax.set_title(
-        "External Factors Correlation Heatmap",
-        color="white", fontsize=13, fontweight="bold", pad=14,
-    )
-
-    for x in np.arange(-0.5, n, 1):
-        ax.axhline(x, color="#2a2a3e", linewidth=1.5)
-        ax.axvline(x, color="#2a2a3e", linewidth=1.5)
-
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=120, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buf.seek(0)
-
-    return base64.b64encode(buf.read()).decode("utf-8")
+    """Heatmap image generation moved to frontend. Returns None."""
+    return None
 
 
 def generate_heatmap_from_df(df: pd.DataFrame) -> str | None:
-    """Convenience wrapper — accepts a DataFrame directly."""
-    rows = df[[c for c in EXTERNAL_FACTORS if c in df.columns]].to_dict(orient="records")
-    return generate_heatmap(rows)
+    """Heatmap image generation moved to frontend. Returns None."""
+    return None

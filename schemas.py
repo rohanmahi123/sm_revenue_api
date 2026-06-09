@@ -277,3 +277,52 @@ class BatchPredictResponse(BaseModel):
     predictions: List[BatchPredictRow]
     summary: BatchPredictSummary
     external_factors_info: Optional[str] = None
+
+
+# ──────────────────────────────────────────────
+# Enhanced batch prediction schemas (from-batch v2)
+# ──────────────────────────────────────────────
+
+class BatchPredictRowEnhanced(BaseModel):
+    order_date: str
+    row_type: str                          # "historical" or "future"
+    region: Optional[str] = None
+    geo: Optional[str] = None
+    country: Optional[str] = None
+    item_type: Optional[str] = None
+    customer: Optional[str] = None
+    # Actual values from CSV (None for future rows)
+    actual_total_revenue: Optional[float] = None
+    actual_COGS: Optional[float] = None
+    actual_gross_profit: Optional[float] = None
+    # Predicted values (always present)
+    predicted_total_revenue: Optional[float] = None
+    predicted_COGS: Optional[float] = None
+    predicted_SGA: Optional[float] = None
+    predicted_gross_profit: Optional[float] = None
+    model_used_revenue: Optional[str] = None
+    model_used_COGS: Optional[str] = None
+    model_used_SGA: Optional[str] = None
+
+
+class BatchPredictSummaryEnhanced(BaseModel):
+    historical_row_count: int
+    future_row_count: int
+    total_row_count: int
+    # Actuals (from CSV historical rows only)
+    gross_actual_revenue: float
+    total_actual_gross_profit: float
+    # Predicted (historical + future combined)
+    gross_predicted_revenue: float
+    total_predicted_gross_profit: float
+
+
+class BatchPredictResponseEnhanced(BaseModel):
+    model_id: int
+    model_name: str
+    batch_id: int
+    sl_file_path: str
+    filters_applied: Dict[str, Optional[str]]
+    predictions: List[BatchPredictRowEnhanced]
+    summary: BatchPredictSummaryEnhanced
+    external_factors_info: Optional[str] = None

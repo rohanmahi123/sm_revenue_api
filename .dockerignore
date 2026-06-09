@@ -8,11 +8,10 @@ __pycache__
 # Secrets
 .env
 
-# Local DB (SQLite travels via volume or is recreated)
-sm_revenue.db
+
 
 # Model store — handled via Docker volume, not baked into image
-model_store/
+
 
 # Dev/test scripts
 test_*.py

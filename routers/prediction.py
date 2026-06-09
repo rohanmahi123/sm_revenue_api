@@ -10,10 +10,11 @@ POST /predict/{model_id}
 import io
 import os
 from datetime import date, datetime
+from typing import Optional
 
 import pandas as pd
 import requests as http_requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
@@ -21,12 +22,16 @@ from config import settings
 from db.main_session import get_main_db
 from db.models import FileUpload, IngestionBatch, TrainedModel
 from db.session import get_db
+from ml.ext_factors import load_ext_factors, merge_ext_factors
 from ml.predictor import predict
 from schemas import (
     BatchPredictRequest,
     BatchPredictResponse,
     BatchPredictRow,
     BatchPredictSummary,
+    BatchPredictRowEnhanced,
+    BatchPredictSummaryEnhanced,
+    BatchPredictResponseEnhanced,
     ForecastRequest,
     ForecastResponse,
     ForecastSummary,
@@ -235,32 +240,54 @@ def _load_sl_csv(file_path: str) -> pd.DataFrame:
 
 @router.post(
     "/from-batch/{model_id}",
-    response_model=BatchPredictResponse,
-    summary="Predict using the SUBLEDGER CSV already uploaded for a batch",
+    response_model=BatchPredictResponseEnhanced,
+    summary="Predict from batch SUBLEDGER — actual vs predicted, with optional filters and future forecast",
     description=(
-        "Looks up the SUBLEDGER file that was uploaded as part of `batch_id` "
-        "(scoped to the authenticated user), reads every row from that CSV, "
-        "and runs the specified model against all rows. "
-        "Optional external-factor overrides (CCI, CPI, Oil, GDP, Unemployment, ROI) "
-        "are applied uniformly to every row, supplementing or replacing values "
-        "found in the CSV."
+        "Reads the SUBLEDGER CSV for the given batch, merges external factors by month, "
+        "and runs predictions on every row. "
+        "Optional filters: country, region, geo (single values, case-insensitive). "
+        "Optional date filters: prediction_start (show CSV rows from this date onward), "
+        "prediction_end (also generate synthetic future monthly rows beyond the CSV). "
+        "Each row in the response shows the actual values from the CSV alongside the "
+        "predicted values. Future rows (beyond the CSV date range) show predicted values only. "
+        "Summary includes total actual revenue/gross profit vs total predicted."
     ),
 )
 def predict_from_batch(
     model_id: int,
     payload: BatchPredictRequest,
-    db: Session = Depends(get_db),           # ML SQLite — trained models
-    main_db: Session = Depends(get_main_db), # Supabase — batches & file uploads
+    # ── Optional filters as query params ──────────────────────────────────────
+    country:          Optional[str] = None,
+    region:           Optional[str] = None,
+    geo:              Optional[str] = None,
+    prediction_start: Optional[str] = None,
+    prediction_end:   Optional[str] = None,
+    db: Session = Depends(get_db),
+    main_db: Session = Depends(get_main_db),
     current_user=Depends(get_current_user),
 ):
-    # ── Validate model (SQLite) ───────────────────────────────────────────────
+    # ── Validate model ────────────────────────────────────────────────────────
     tm = db.query(TrainedModel).get(model_id)
     if not tm:
         raise HTTPException(status_code=404, detail="Model not found.")
 
-    # ── Look up the SUBLEDGER file for this batch (Supabase) ─────────────────
+    # ── Validate date params ──────────────────────────────────────────────────
+    pred_start_dt = pred_end_dt = None
+    if prediction_start:
+        try:
+            pred_start_dt = datetime.strptime(prediction_start, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="prediction_start must be YYYY-MM-DD.")
+    if prediction_end:
+        try:
+            pred_end_dt = datetime.strptime(prediction_end, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="prediction_end must be YYYY-MM-DD.")
+
+    # ── Look up batch + SUBLEDGER file (Supabase) ────────────────────────────
     batch = main_db.query(IngestionBatch).filter(
         IngestionBatch.id == payload.batch_id,
+        IngestionBatch.company_id == current_user.company_id,
     ).first()
     if not batch:
         raise HTTPException(status_code=404, detail=f"Batch {payload.batch_id} not found.")
@@ -270,113 +297,244 @@ def predict_from_batch(
         FileUpload.file_type == "SUBLEDGER",
     ).first()
     if not sl_upload or not sl_upload.file_path:
-        raise HTTPException(
-            status_code=404,
-            detail="No SUBLEDGER file found for this batch.",
-        )
+        raise HTTPException(status_code=404, detail="No SUBLEDGER file found for this batch.")
 
-    # ── Load CSV ──────────────────────────────────────────────────────────────
+    # ── Load + clean CSV ──────────────────────────────────────────────────────
     try:
         df = _load_sl_csv(sl_upload.file_path)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read SL file: {exc}")
 
     if df.empty:
         raise HTTPException(status_code=422, detail="SUBLEDGER CSV is empty.")
 
-    # ── Clean: strip $, commas — same as training preprocessing ──────────────
     df = _clean_sl_df(df)
-
-    # ── Normalise column names ────────────────────────────────────────────────
     df = df.rename(columns=_SL_RENAME)
 
     if "order_date" not in df.columns:
-        raise HTTPException(
-            status_code=422,
-            detail="SUBLEDGER CSV must contain an 'Order Date' column.",
-        )
+        raise HTTPException(status_code=422, detail="SUBLEDGER CSV must have an 'Order Date' column.")
 
-    # ── Detect which external factors are already in the CSV ─────────────────
-    EXT_FACTORS = ["CCI", "CPI", "Oil", "GDP", "Unemployment", "ROI"]
-    factors_from_csv = [f for f in EXT_FACTORS if f in df.columns and df[f].notna().any()]
-    factors_missing  = [f for f in EXT_FACTORS if f not in factors_from_csv]
+    # ── Parse order_date ──────────────────────────────────────────────────────
+    df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+    df = df.dropna(subset=["order_date"])
 
-    # User-provided overrides (only applied if explicitly passed)
-    ext_overrides = {
-        k: v for k, v in {
-            "CCI": payload.CCI,
-            "CPI": payload.CPI,
-            "Oil": payload.Oil,
-            "GDP": payload.GDP,
-            "Unemployment": payload.Unemployment,
-            "ROI": payload.ROI,
-        }.items() if v is not None
+    # ── Apply filters (case-insensitive) ──────────────────────────────────────
+    if region:
+        df = df[df["Region"].astype(str).str.strip().str.lower() == region.strip().lower()]
+        if df.empty:
+            raise HTTPException(status_code=404, detail="No rows found after applying filters: Region")
+    if geo:
+        df = df[df["Geo"].astype(str).str.strip().str.lower() == geo.strip().lower()]
+        if df.empty:
+            raise HTTPException(status_code=404, detail="No rows found after applying filters: Geo")
+    if country:
+        df = df[df["Country"].astype(str).str.strip().str.lower() == country.strip().lower()]
+        if df.empty:
+            raise HTTPException(status_code=404, detail="No rows found after applying filters : Country.")
+
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No rows found after applying filters.")
+
+    # ── Stash actual values before merging external factors ───────────────────
+    ACTUAL_COLS = {
+        "Total Revenue": "actual_total_revenue",
+        "COGS":          "actual_COGS",
+        "Gross Profit":  "actual_gross_profit",
     }
+    for src, dst in ACTUAL_COLS.items():
+        df[dst] = pd.to_numeric(df.get(src, pd.Series(dtype=float)), errors="coerce") if src in df.columns else float("nan")
 
-    input_rows = []
-    for _, row in df.iterrows():
-        r = row.to_dict()
-        # Apply user overrides on top (user value wins over CSV value if provided)
-        r.update(ext_overrides)
-        input_rows.append(r)
+    df["order_date"] = df["order_date"].dt.strftime("%Y-%m-%d")
 
-    # ── Run model ─────────────────────────────────────────────────────────────
+    # ── Merge external factors (historical) ───────────────────────────────────
+    ext_df = load_ext_factors(settings.MODEL_STORE_DIR)
+    if ext_df is not None:
+        df, ext_msg = merge_ext_factors(df, ext_df)
+    else:
+        ext_msg = "No external_factors.csv in model_store — model used training medians."
+
+    # ── Predict historical rows ───────────────────────────────────────────────
+    hist_input = df.to_dict(orient="records")
     try:
-        results = predict(tm.model_file_path, input_rows)
+        hist_results = predict(tm.model_file_path, hist_input)
     except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail="Model file not found on disk. It may have been deleted manually.",
-        )
+        raise HTTPException(status_code=500, detail="Model .pkl file not found on disk.")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Prediction error: {exc}")
 
-    # ── Build response ────────────────────────────────────────────────────────
-    predictions = []
-    total_revenue = total_cogs = total_sga = 0.0
+    # ── Build historical prediction rows ──────────────────────────────────────
+    predictions: list[BatchPredictRowEnhanced] = []
+    total_actual_revenue = total_actual_gp = 0.0
+    total_pred_revenue = total_pred_gp = 0.0
 
-    for res in results:
-        rev  = res.get("predicted_total_revenue") or 0.0
-        cogs = res.get("predicted_COGS") or 0.0
-        sga  = res.get("predicted_SGA") or 0.0
-        total_revenue += rev
-        total_cogs    += cogs
-        total_sga     += sga
+    for raw_row, res in zip(hist_input, hist_results):
+        pred_rev  = res.get("predicted_total_revenue") or 0.0
+        pred_cogs = res.get("predicted_COGS") or 0.0
+        pred_gp   = pred_rev - pred_cogs
 
-        predictions.append(BatchPredictRow(
-            order_date=res.get("order_date", ""),
-            predicted_total_revenue=res.get("predicted_total_revenue"),
-            predicted_COGS=res.get("predicted_COGS"),
-            predicted_SGA=res.get("predicted_SGA"),
+        act_rev = raw_row.get("actual_total_revenue")
+        act_cogs = raw_row.get("actual_COGS")
+        act_gp  = raw_row.get("actual_gross_profit")
+
+        total_actual_revenue += act_rev if act_rev and not pd.isna(act_rev) else 0.0
+        total_actual_gp      += act_gp  if act_gp  and not pd.isna(act_gp)  else 0.0
+        total_pred_revenue   += pred_rev
+        total_pred_gp        += pred_gp
+
+        predictions.append(BatchPredictRowEnhanced(
+            order_date=str(raw_row.get("order_date", "")),
+            row_type="historical",
+            region=str(raw_row.get("Region") or ""),
+            geo=str(raw_row.get("Geo") or ""),
+            country=str(raw_row.get("Country") or ""),
+            item_type=str(raw_row.get("Item_type") or ""),
+            customer=str(raw_row.get("Customer") or ""),
+            actual_total_revenue=None if (act_rev is None or (isinstance(act_rev, float) and pd.isna(act_rev))) else round(act_rev, 4),
+            actual_COGS=None if (act_cogs is None or (isinstance(act_cogs, float) and pd.isna(act_cogs))) else round(act_cogs, 4),
+            actual_gross_profit=None if (act_gp is None or (isinstance(act_gp, float) and pd.isna(act_gp))) else round(act_gp, 4),
+            predicted_total_revenue=round(pred_rev, 4),
+            predicted_COGS=round(pred_cogs, 4),
+            predicted_SGA=round(res.get("predicted_SGA") or 0.0, 4),
+            predicted_gross_profit=round(pred_gp, 4),
             model_used_revenue=res.get("model_used_revenue"),
             model_used_COGS=res.get("model_used_COGS"),
             model_used_SGA=res.get("model_used_SGA"),
         ))
 
-    # Build info message about external factor sources
-    if factors_from_csv and not factors_missing:
-        ext_msg = f"All external factors used from CSV: {factors_from_csv}."
-    elif factors_from_csv and factors_missing:
-        ext_msg = (f"External factors from CSV: {factors_from_csv}. "
-                   f"Missing (not in CSV, set to NaN): {factors_missing}.")
-    else:
-        ext_msg = "No external factors found in CSV — model used training medians."
-    if ext_overrides:
-        ext_msg += f" User overrides applied: {list(ext_overrides.keys())}."
+    hist_count = len(predictions)
 
-    return BatchPredictResponse(
+    # ── Generate future rows if prediction_end is beyond last CSV date ─────────
+    future_count = 0
+    if pred_end_dt:
+        last_csv_date = pd.to_datetime(df["order_date"]).max().date()
+
+        # Future start = prediction_start if given and it's beyond CSV, else next month after CSV
+        if pred_start_dt and pred_start_dt > last_csv_date:
+            future_gen_start = pred_start_dt.replace(day=1)
+        else:
+            # Next month after last CSV date
+            m = last_csv_date.month + 1
+            y = last_csv_date.year + (1 if m > 12 else 0)
+            m = 1 if m > 12 else m
+            future_gen_start = date(y, m, 1)
+
+        if pred_end_dt >= future_gen_start:
+            future_months = _monthly_dates(future_gen_start, pred_end_dt)
+        else:
+            future_months = []
+
+        if future_months:
+                # Unique combos of (Region, Geo, Country, Customer, Item_type)
+                COST_COLS = ["Raw_Material", "Direct_Labor", "Freight", "Storage",
+                             "Packaging", "Indirect_Labor", "Rent_Utility", "Overhead"]
+                combo_cols = ["Region", "Geo", "Country", "Customer", "Item_type"]
+                df_num = df.copy()
+                for c in COST_COLS:
+                    if c in df_num.columns:
+                        df_num[c] = pd.to_numeric(df_num[c], errors="coerce")
+
+                combos = df[[c for c in combo_cols if c in df.columns]].drop_duplicates()
+
+                # Build ext factor lookup: period → dict of factor values
+                ext_lookup: dict = {}
+                last_ext_row: dict = {}
+                if ext_df is not None:
+                    for _, er in ext_df.sort_values("year_month").iterrows():
+                        key = str(er["year_month"])
+                        row_vals = {c: er[c] for c in ["CCI", "CPI", "Oil", "GDP", "Unemployment", "ROI"] if c in er}
+                        ext_lookup[key] = row_vals
+                        last_ext_row = row_vals  # keep last known
+
+                future_input_rows = []
+                future_meta = []
+
+                for future_date in future_months:
+                    period_key = str(pd.Period(future_date, "M"))
+                    ext_vals = ext_lookup.get(period_key, last_ext_row)
+
+                    for _, combo in combos.iterrows():
+                        # Median cost features for this combo from historical data
+                        mask = pd.Series([True] * len(df_num))
+                        for c in combo_cols:
+                            if c in df_num.columns and c in combo.index:
+                                mask = mask & (df_num[c].astype(str) == str(combo[c]))
+
+                        combo_df = df_num[mask]
+                        cost_features = {}
+                        for c in COST_COLS:
+                            if c in combo_df.columns:
+                                val = combo_df[c].median()
+                                cost_features[c] = float(val) if not pd.isna(val) else None
+
+                        future_row = {
+                            "order_date": future_date.isoformat(),
+                            "Region": combo.get("Region", ""),
+                            "Geo": combo.get("Geo", ""),
+                            "Country": combo.get("Country", ""),
+                            "Item_type": combo.get("Item_type", ""),
+                            "Customer": combo.get("Customer", ""),
+                            **cost_features,
+                            **ext_vals,
+                        }
+                        future_input_rows.append(future_row)
+                        future_meta.append(combo.to_dict())
+
+                if future_input_rows:
+                    try:
+                        future_results = predict(tm.model_file_path, future_input_rows)
+                    except Exception as exc:
+                        raise HTTPException(status_code=500, detail=f"Future prediction error: {exc}")
+
+                    for f_raw, f_res in zip(future_input_rows, future_results):
+                        pred_rev  = f_res.get("predicted_total_revenue") or 0.0
+                        pred_cogs = f_res.get("predicted_COGS") or 0.0
+                        pred_gp   = pred_rev - pred_cogs
+
+                        total_pred_revenue += pred_rev
+                        total_pred_gp      += pred_gp
+
+                        predictions.append(BatchPredictRowEnhanced(
+                            order_date=str(f_raw.get("order_date", "")),
+                            row_type="future",
+                            region=str(f_raw.get("Region") or ""),
+                            geo=str(f_raw.get("Geo") or ""),
+                            country=str(f_raw.get("Country") or ""),
+                            item_type=str(f_raw.get("Item_type") or ""),
+                            customer=str(f_raw.get("Customer") or ""),
+                            actual_total_revenue=None,
+                            actual_COGS=None,
+                            actual_gross_profit=None,
+                            predicted_total_revenue=round(pred_rev, 4),
+                            predicted_COGS=round(pred_cogs, 4),
+                            predicted_SGA=round(f_res.get("predicted_SGA") or 0.0, 4),
+                            predicted_gross_profit=round(pred_gp, 4),
+                            model_used_revenue=f_res.get("model_used_revenue"),
+                            model_used_COGS=f_res.get("model_used_COGS"),
+                            model_used_SGA=f_res.get("model_used_SGA"),
+                        ))
+                        future_count += 1
+
+    return BatchPredictResponseEnhanced(
         model_id=tm.id,
         model_name=tm.model_name,
         batch_id=payload.batch_id,
         sl_file_path=sl_upload.file_path,
+        filters_applied={
+            "country": country,
+            "region": region,
+            "geo": geo,
+            "prediction_start": prediction_start,
+            "prediction_end": prediction_end,
+        },
         predictions=predictions,
-        summary=BatchPredictSummary(
-            total_revenue=round(total_revenue, 4),
-            total_COGS=round(total_cogs, 4),
-            total_SGA=round(total_sga, 4),
-            row_count=len(predictions),
+        summary=BatchPredictSummaryEnhanced(
+            historical_row_count=hist_count,
+            future_row_count=future_count,
+            total_row_count=hist_count + future_count,
+            gross_actual_revenue=round(total_actual_revenue, 4),
+            total_actual_gross_profit=round(total_actual_gp, 4),
+            gross_predicted_revenue=round(total_pred_revenue, 4),
+            total_predicted_gross_profit=round(total_pred_gp, 4),
         ),
         external_factors_info=ext_msg,
     )

@@ -2,16 +2,10 @@
 
 from __future__ import annotations
 
-import base64
 import io
 from collections import defaultdict
 from typing import List, Optional
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -56,106 +50,8 @@ def _generate_forecast_map(
     region_summary: List[RegionForecast],
     model_name: str,
 ) -> str | None:
-    if not region_summary:
-        return None
-
-    regions = [r.region for r in region_summary]
-    revenues = [r.total_revenue for r in region_summary]
-    cogs = [r.total_COGS for r in region_summary]
-    sga = [r.total_SGA for r in region_summary]
-
-    n = len(regions)
-    x = np.arange(n)
-    bar_w = 0.28
-
-    # ── Colors ────────────────────────────────────────────────────────────────
-    BG = "#0f0f1a"
-    GRID = "#1e1e30"
-    REV_COLOR = "#4f9cf9"
-    COGS_COLOR = "#f97b4f"
-    SGA_COLOR = "#7bf97b"
-    TEXT = "#e0e0ff"
-
-    fig, (ax_map, ax_bar) = plt.subplots(
-        1, 2, figsize=(16, 7), gridspec_kw={"width_ratios": [1.2, 1.8]}
-    )
-    fig.patch.set_facecolor(BG)
-
-    # ── LEFT: Bubble "map" (region bubbles sized by revenue) ──────────────────
-    ax_map.set_facecolor(BG)
-    ax_map.set_xlim(-1, 3)
-    ax_map.set_ylim(-1, n + 1)
-    ax_map.axis("off")
-    ax_map.set_title("Revenue by Region", color=TEXT, fontsize=13, fontweight="bold", pad=12)
-
-    max_rev = max(revenues) if revenues else 1
-    cmap = plt.get_cmap("cool")
-
-    for i, (reg, rev) in enumerate(zip(regions, revenues)):
-        size = 1800 * (rev / max_rev) + 300
-        color = cmap(rev / max_rev)
-        y_pos = n - i - 0.5
-
-        ax_map.scatter(1, y_pos, s=size, color=color, alpha=0.85, zorder=3)
-        ax_map.text(
-            1, y_pos, f"${rev:,.0f}",
-            ha="center", va="center",
-            fontsize=8, color="white", fontweight="bold", zorder=4,
-        )
-        ax_map.text(
-            1.85, y_pos, reg,
-            ha="left", va="center",
-            fontsize=10, color=TEXT,
-        )
-
-    # ── RIGHT: Grouped bar chart ───────────────────────────────────────────────
-    ax_bar.set_facecolor(BG)
-    ax_bar.set_axisbelow(True)
-    ax_bar.yaxis.grid(True, color=GRID, linewidth=0.8)
-    ax_bar.set_facecolor(BG)
-
-    b1 = ax_bar.bar(x - bar_w, revenues, bar_w, label="Total Revenue", color=REV_COLOR, alpha=0.9)
-    b2 = ax_bar.bar(x,         cogs,     bar_w, label="COGS",          color=COGS_COLOR, alpha=0.9)
-    b3 = ax_bar.bar(x + bar_w, sga,      bar_w, label="SG&A",          color=SGA_COLOR,  alpha=0.9)
-
-    # Value labels on bars
-    for bars in (b1, b2, b3):
-        for bar in bars:
-            h = bar.get_height()
-            ax_bar.text(
-                bar.get_x() + bar.get_width() / 2,
-                h * 1.01,
-                f"${h/1000:.1f}k" if h >= 1000 else f"${h:.0f}",
-                ha="center", va="bottom",
-                fontsize=7.5, color=TEXT,
-            )
-
-    ax_bar.set_xticks(x)
-    ax_bar.set_xticklabels(regions, rotation=30, ha="right", color=TEXT, fontsize=10)
-    ax_bar.tick_params(axis="y", colors=TEXT)
-    ax_bar.spines[:].set_visible(False)
-    ax_bar.set_title("Revenue vs COGS vs SG&A by Region", color=TEXT, fontsize=13, fontweight="bold", pad=12)
-
-    legend = ax_bar.legend(
-        handles=[
-            mpatches.Patch(color=REV_COLOR, label="Total Revenue"),
-            mpatches.Patch(color=COGS_COLOR, label="COGS"),
-            mpatches.Patch(color=SGA_COLOR,  label="SG&A"),
-        ],
-        facecolor="#1a1a2e", labelcolor=TEXT, framealpha=0.8, fontsize=9,
-    )
-
-    fig.suptitle(
-        f"Sales Forecast Map — {model_name}",
-        color=TEXT, fontsize=15, fontweight="bold", y=1.01,
-    )
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("utf-8")
+    """Returns None — chart generation not used in this endpoint."""
+    return None
 
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────
@@ -266,8 +162,8 @@ class BatchForecastMapResponse(BaseModel):
 import io as _io
 import os as _os
 import requests as _http
+from ml.ext_factors import load_ext_factors, merge_ext_factors
 
-_EXT_FACTORS = ["CCI", "CPI", "Oil", "GDP", "Unemployment", "ROI"]
 _KEEP_AS_STR  = {"Region", "Geo", "Country", "Item type", "Customer",
                  "Order Id", "Order Date", "order_date"}
 _SL_RENAME    = {
@@ -337,6 +233,7 @@ def forecast_map_from_batch(
     # ── Look up SUBLEDGER file ────────────────────────────────────────────────
     batch = main_db.query(IngestionBatch).filter(
         IngestionBatch.id == batch_id,
+        IngestionBatch.company_id == current_user.company_id,
     ).first()
     if not batch:
         raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found.")
@@ -360,17 +257,13 @@ def forecast_map_from_batch(
     if "order_date" not in df.columns:
         raise HTTPException(status_code=422, detail="SUBLEDGER CSV must have an 'Order Date' column.")
 
-    # ── Detect external factors in CSV ────────────────────────────────────────
-    factors_from_csv = [f for f in _EXT_FACTORS if f in df.columns and df[f].notna().any()]
-    factors_missing  = [f for f in _EXT_FACTORS if f not in factors_from_csv]
-
-    if factors_from_csv and not factors_missing:
-        ext_info = f"All external factors from CSV: {factors_from_csv}."
-    elif factors_from_csv:
-        ext_info = (f"From CSV: {factors_from_csv}. "
-                    f"Missing (NaN): {factors_missing}.")
+    # ── Merge external factors from stored file (by month) ───────────────────
+    from config import settings as _settings
+    ext_df = load_ext_factors(_settings.MODEL_STORE_DIR)
+    if ext_df is not None:
+        df, ext_info = merge_ext_factors(df, ext_df)
     else:
-        ext_info = "No external factors in CSV — model used training medians."
+        ext_info = "No external_factors.csv found in model_store — model used training medians."
 
     # ── Run prediction ────────────────────────────────────────────────────────
     input_rows = df.to_dict(orient="records")

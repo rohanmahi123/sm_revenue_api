@@ -1,37 +1,43 @@
-# ── Base image ────────────────────────────────────────────────────────────────
-FROM python:3.11-slim
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
 
-# ── System dependencies ───────────────────────────────────────────────────────
-# gcc + libpq-dev  → psycopg2
-# libgomp1         → scikit-learn (OpenMP for parallel jobs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+# Install into a separate folder so we can copy only that
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+
+# ── Stage 2: Final slim image ─────────────────────────────────────────────────
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Working directory ─────────────────────────────────────────────────────────
 WORKDIR /app
 
-# ── Install Python dependencies first (layer cached until requirements change) ─
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy only installed packages from builder
+COPY --from=builder /install /usr/local
 
-# ── Copy application code ─────────────────────────────────────────────────────
+# Copy only app code
 COPY auth.py config.py database.py main.py models.py schemas.py security.py ./
-COPY db/       ./db/
-COPY ml/       ./ml/
-COPY routers/  ./routers/
+COPY db/          ./db/
+COPY ml/          ./ml/
+COPY routers/     ./routers/
+COPY model_store/ ./model_store/
+COPY sm_revenue.db ./
 
-# ── Create model store directory ──────────────────────────────────────────────
-RUN mkdir -p model_store
-
-# ── Non-root user for security ────────────────────────────────────────────────
 RUN useradd -m appuser && chown -R appuser /app
 USER appuser
 
-# ── Expose port ───────────────────────────────────────────────────────────────
 EXPOSE 8000
 
-# ── Start server ──────────────────────────────────────────────────────────────
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
