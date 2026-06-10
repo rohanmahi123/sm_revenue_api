@@ -339,6 +339,7 @@ def predict_from_batch(
     ACTUAL_COLS = {
         "Total Revenue": "actual_total_revenue",
         "COGS":          "actual_COGS",
+        "SG&A":          "actual_SGA",
         "Gross Profit":  "actual_gross_profit",
     }
     for src, dst in ACTUAL_COLS.items():
@@ -372,9 +373,10 @@ def predict_from_batch(
         pred_cogs = res.get("predicted_COGS") or 0.0
         pred_gp   = pred_rev - pred_cogs
 
-        act_rev = raw_row.get("actual_total_revenue")
+        act_rev  = raw_row.get("actual_total_revenue")
         act_cogs = raw_row.get("actual_COGS")
-        act_gp  = raw_row.get("actual_gross_profit")
+        act_sga  = raw_row.get("actual_SGA")
+        act_gp   = raw_row.get("actual_gross_profit")
 
         total_actual_revenue += act_rev if act_rev and not pd.isna(act_rev) else 0.0
         total_actual_gp      += act_gp  if act_gp  and not pd.isna(act_gp)  else 0.0
@@ -391,6 +393,7 @@ def predict_from_batch(
             customer=str(raw_row.get("Customer") or ""),
             actual_total_revenue=None if (act_rev is None or (isinstance(act_rev, float) and pd.isna(act_rev))) else round(act_rev, 4),
             actual_COGS=None if (act_cogs is None or (isinstance(act_cogs, float) and pd.isna(act_cogs))) else round(act_cogs, 4),
+            actual_SGA=None if (act_sga is None or (isinstance(act_sga, float) and pd.isna(act_sga))) else round(act_sga, 4),
             actual_gross_profit=None if (act_gp is None or (isinstance(act_gp, float) and pd.isna(act_gp))) else round(act_gp, 4),
             predicted_total_revenue=round(pred_rev, 4),
             predicted_COGS=round(pred_cogs, 4),

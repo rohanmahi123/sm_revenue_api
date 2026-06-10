@@ -294,6 +294,7 @@ class BatchPredictRowEnhanced(BaseModel):
     # Actual values from CSV (None for future rows)
     actual_total_revenue: Optional[float] = None
     actual_COGS: Optional[float] = None
+    actual_SGA: Optional[float] = None
     actual_gross_profit: Optional[float] = None
     # Predicted values (always present)
     predicted_total_revenue: Optional[float] = None
