@@ -257,11 +257,9 @@ def predict_from_batch(
     model_id: int,
     payload: BatchPredictRequest,
     # ── Optional filters as query params ──────────────────────────────────────
-    country:          Optional[str] = None,
-    region:           Optional[str] = None,
-    geo:              Optional[str] = None,
     prediction_start: Optional[str] = None,
     prediction_end:   Optional[str] = None,
+    show_all:         bool = False,
     db: Session = Depends(get_db),
     main_db: Session = Depends(get_main_db),
     current_user=Depends(get_current_user),
@@ -319,21 +317,52 @@ def predict_from_batch(
     df = df.dropna(subset=["order_date"])
 
     # ── Apply filters (case-insensitive) ──────────────────────────────────────
-    if region:
-        df = df[df["Region"].astype(str).str.strip().str.lower() == region.strip().lower()]
+    if payload.region:
+        df = df[df["Region"].astype(str).str.strip().str.lower() == payload.region.strip().lower()]
         if df.empty:
             raise HTTPException(status_code=404, detail="No rows found after applying filters: Region")
-    if geo:
-        df = df[df["Geo"].astype(str).str.strip().str.lower() == geo.strip().lower()]
+    if payload.geo:
+        df = df[df["Geo"].astype(str).str.strip().str.lower() == payload.geo.strip().lower()]
         if df.empty:
             raise HTTPException(status_code=404, detail="No rows found after applying filters: Geo")
-    if country:
-        df = df[df["Country"].astype(str).str.strip().str.lower() == country.strip().lower()]
+    if payload.country:
+        df = df[df["Country"].astype(str).str.strip().str.lower() == payload.country.strip().lower()]
         if df.empty:
-            raise HTTPException(status_code=404, detail="No rows found after applying filters : Country.")
+            raise HTTPException(status_code=404, detail="No rows found after applying filters: Country.")
 
     if df.empty:
         raise HTTPException(status_code=404, detail="No rows found after applying filters.")
+
+    # ── Date range filter (only when show_all is False) ───────────────────────
+    if not show_all:
+        if payload.date_from:
+            try:
+                df_from_dt = datetime.strptime(payload.date_from, "%Y-%m-%d")
+                df = df[df["order_date"] >= df_from_dt]
+            except ValueError:
+                raise HTTPException(status_code=422, detail="date_from must be YYYY-MM-DD.")
+        if payload.date_to:
+            try:
+                df_to_dt = datetime.strptime(payload.date_to, "%Y-%m-%d")
+                df = df[df["order_date"] <= df_to_dt]
+            except ValueError:
+                raise HTTPException(status_code=422, detail="date_to must be YYYY-MM-DD.")
+        if df.empty:
+            raise HTTPException(status_code=404, detail="No rows found in the given date range.")
+
+    # ── date_to also drives future generation if beyond last CSV date ──────────
+    if payload.date_to:
+        try:
+            pred_end_dt = datetime.strptime(payload.date_to, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+
+    # ── future_end overrides date_to for future generation when show_all=true ──
+    if payload.future_end:
+        try:
+            pred_end_dt = datetime.strptime(payload.future_end, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="future_end must be YYYY-MM-DD.")
 
     # ── Stash actual values before merging external factors ───────────────────
     ACTUAL_COLS = {
@@ -523,11 +552,13 @@ def predict_from_batch(
         batch_id=payload.batch_id,
         sl_file_path=sl_upload.file_path,
         filters_applied={
-            "country": country,
-            "region": region,
-            "geo": geo,
-            "prediction_start": prediction_start,
-            "prediction_end": prediction_end,
+            "country": payload.country,
+            "region": payload.region,
+            "geo": payload.geo,
+            "date_from": payload.date_from,
+            "date_to": payload.date_to,
+            "future_end": payload.future_end,
+            "show_all": str(show_all),
         },
         predictions=predictions,
         summary=BatchPredictSummaryEnhanced(
