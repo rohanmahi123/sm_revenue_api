@@ -264,6 +264,16 @@ def predict_from_batch(
     main_db: Session = Depends(get_main_db),
     current_user=Depends(get_current_user),
 ):
+    try:
+     return _predict_from_batch_inner(model_id, payload, prediction_start, prediction_end, show_all, db, main_db, current_user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_end, show_all, db, main_db, current_user):
     # ── Validate model ────────────────────────────────────────────────────────
     tm = db.query(TrainedModel).get(model_id)
     if not tm:
@@ -271,16 +281,6 @@ def predict_from_batch(
 
     # ── Validate date params ──────────────────────────────────────────────────
     pred_start_dt = pred_end_dt = None
-    if prediction_start:
-        try:
-            pred_start_dt = datetime.strptime(prediction_start, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=422, detail="prediction_start must be YYYY-MM-DD.")
-    if prediction_end:
-        try:
-            pred_end_dt = datetime.strptime(prediction_end, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=422, detail="prediction_end must be YYYY-MM-DD.")
 
     # ── Look up batch + SUBLEDGER file (Supabase) ────────────────────────────
     batch = main_db.query(IngestionBatch).filter(
@@ -316,6 +316,10 @@ def predict_from_batch(
     df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
     df = df.dropna(subset=["order_date"])
 
+    # Capture the full-CSV last date BEFORE any filters so future generation
+    # is only triggered when date_to is truly beyond the entire dataset.
+    full_csv_last_date = df["order_date"].max().date()
+
     # ── Apply filters (case-insensitive) ──────────────────────────────────────
     if payload.region:
         df = df[df["Region"].astype(str).str.strip().str.lower() == payload.region.strip().lower()]
@@ -335,34 +339,28 @@ def predict_from_batch(
 
     # ── Date range filter (only when show_all is False) ───────────────────────
     if not show_all:
-        if payload.date_from:
+        if prediction_start:
             try:
-                df_from_dt = datetime.strptime(payload.date_from, "%Y-%m-%d")
-                df = df[df["order_date"] >= df_from_dt]
+                pred_start_dt = datetime.strptime(prediction_start, "%Y-%m-%d")
+                df = df[df["order_date"] >= pred_start_dt]
             except ValueError:
-                raise HTTPException(status_code=422, detail="date_from must be YYYY-MM-DD.")
-        if payload.date_to:
+                raise HTTPException(status_code=422, detail="prediction_start must be YYYY-MM-DD.")
+        if prediction_end:
             try:
-                df_to_dt = datetime.strptime(payload.date_to, "%Y-%m-%d")
+                df_to_dt = datetime.strptime(prediction_end, "%Y-%m-%d")
                 df = df[df["order_date"] <= df_to_dt]
             except ValueError:
-                raise HTTPException(status_code=422, detail="date_to must be YYYY-MM-DD.")
+                raise HTTPException(status_code=422, detail="prediction_end must be YYYY-MM-DD.")
         if df.empty:
             raise HTTPException(status_code=404, detail="No rows found in the given date range.")
 
-    # ── date_to also drives future generation if beyond last CSV date ──────────
-    if payload.date_to:
+    # ── prediction_end also drives future generation if beyond full CSV range ──
+    if prediction_end:
         try:
-            pred_end_dt = datetime.strptime(payload.date_to, "%Y-%m-%d").date()
+            pred_end_dt = datetime.strptime(prediction_end, "%Y-%m-%d").date()
         except ValueError:
             pass
 
-    # ── future_end overrides date_to for future generation when show_all=true ──
-    if payload.future_end:
-        try:
-            pred_end_dt = datetime.strptime(payload.future_end, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=422, detail="future_end must be YYYY-MM-DD.")
 
     # ── Stash actual values before merging external factors ───────────────────
     ACTUAL_COLS = {
@@ -438,11 +436,11 @@ def predict_from_batch(
     # ── Generate future rows if prediction_end is beyond last CSV date ─────────
     future_count = 0
     if pred_end_dt:
-        last_csv_date = pd.to_datetime(df["order_date"]).max().date()
+        last_csv_date = full_csv_last_date
 
         # Future start = prediction_start if given and it's beyond CSV, else next month after CSV
-        if pred_start_dt and pred_start_dt > last_csv_date:
-            future_gen_start = pred_start_dt.replace(day=1)
+        if pred_start_dt and pred_start_dt.date() > last_csv_date:
+            future_gen_start = pred_start_dt.date().replace(day=1)
         else:
             # Next month after last CSV date
             m = last_csv_date.month + 1
@@ -555,9 +553,9 @@ def predict_from_batch(
             "country": payload.country,
             "region": payload.region,
             "geo": payload.geo,
-            "date_from": payload.date_from,
-            "date_to": payload.date_to,
-            "future_end": payload.future_end,
+            "prediction_start": prediction_start,
+            "prediction_end": prediction_end,
+
             "show_all": str(show_all),
         },
         predictions=predictions,

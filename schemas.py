@@ -247,9 +247,6 @@ class BatchPredictRequest(BaseModel):
     country:    Optional[str] = Field(None, description="Filter by country (case-insensitive)")
     region:     Optional[str] = Field(None, description="Filter by region (case-insensitive)")
     geo:        Optional[str] = Field(None, description="Filter by geo (case-insensitive)")
-    date_from:  Optional[str] = Field(None, description="Filter historical rows from this date (YYYY-MM-DD)")
-    date_to:    Optional[str] = Field(None, description="Filter historical rows up to this date (YYYY-MM-DD)")
-    future_end: Optional[str] = Field(None, description="Generate future rows up to this date (YYYY-MM-DD)")
     CCI: Optional[float] = None
     CPI: Optional[float] = None
     Oil: Optional[float] = None

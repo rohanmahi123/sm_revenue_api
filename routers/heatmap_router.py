@@ -27,9 +27,11 @@ GET /heatmap/data
 """
 
 import io
-from typing import List, Optional
+import os
+from typing import Dict, List, Optional
 
 import pandas as pd
+import requests as http_requests
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -38,6 +40,7 @@ from auth import get_current_user
 from config import settings
 from db.main_session import get_main_db
 from db.models import FileUpload, IngestionBatch
+from ml.ext_factors import EXT_FACTOR_COLS, EXT_FACTORS_FILENAME, load_ext_factors
 from ml.heatmap import (
     EXTERNAL_FACTORS,
     _parse_date_series,
@@ -605,4 +608,746 @@ def heatmap_from_storage(current_user=Depends(get_current_user)):
         correlation=CorrelationMatrix(factors=factors_found, matrix=matrix),
         monthly_data=monthly_data,
         message=f"Data ready. {len(factors_found)} factors, {len(monthly_data)} months.",
+    )
+
+
+# ── Full dataset heatmap: SL CSV + external factors ───────────────────────────
+
+# SL columns included in the full heatmap (must match CSV column names)
+_SL_NUMERIC_COLS = [
+    "Total Revenue", "COGS", "SG&A",
+    "Raw Material", "Direct Labor", "Freight",
+    "Storage", "Packaging", "Indirect Labor",
+    "Rent & Utility", "Overhead",
+]
+
+
+class FullHeatmapRequest(BaseModel):
+    batch_id: int = Field(..., description="Batch ID whose SUBLEDGER CSV to use")
+    # Optional ext factor overrides — only applied when value is non-None AND non-zero
+    CCI:          Optional[float] = Field(None, description="Override CCI — leave empty to use stored data")
+    CPI:          Optional[float] = Field(None, description="Override CPI — leave empty to use stored data")
+    Oil:          Optional[float] = Field(None, description="Override Oil — leave empty to use stored data")
+    GDP:          Optional[float] = Field(None, description="Override GDP — leave empty to use stored data")
+    Unemployment: Optional[float] = Field(None, description="Override Unemployment — leave empty to use stored data")
+    ROI:          Optional[float] = Field(None, description="Override ROI — leave empty to use stored data")
+
+
+class FullHeatmapResponse(BaseModel):
+    columns: List[str]                  # axis labels (same for X and Y)
+    correlation: List[List[float]]      # 2D matrix — ready for Plotly
+    row_count: int                      # number of SL rows used
+    sl_columns_found: List[str]         # which SL numeric cols were present
+    ext_columns_found: List[str]        # which ext factor cols were merged
+    message: str
+
+
+@router.post(
+    "/full-dataset/{model_id}",
+    response_model=FullHeatmapResponse,
+    summary="Full feature correlation heatmap — SL CSV + external factors",
+    description=(
+        "Loads the SUBLEDGER CSV from Supabase Storage for the given batch, "
+        "merges macro-economic external factors (CCI, CPI, Oil, GDP, Unemployment, ROI) "
+        "from the backend-stored external_factors.csv by year-month, "
+        "then computes the Pearson correlation matrix across ALL numeric columns "
+        "(Total Revenue, COGS, SG&A, cost components, and external factors). "
+        "Returns the matrix as JSON — frontend renders with Plotly. "
+        "Pass optional ext factor override values to get an updated matrix "
+        "without re-uploading the CSV (useful for live what-if analysis)."
+    ),
+)
+def full_dataset_heatmap(
+    model_id: int,
+    payload: FullHeatmapRequest,
+    main_db: Session = Depends(get_main_db),
+    current_user=Depends(get_current_user),
+):
+    # ── Validate batch belongs to company ────────────────────────────────────
+    batch = main_db.query(IngestionBatch).filter(
+        IngestionBatch.id == payload.batch_id,
+        IngestionBatch.company_id == current_user.company_id,
+    ).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+    sl_upload = main_db.query(FileUpload).filter(
+        FileUpload.batch_id == payload.batch_id,
+        FileUpload.file_type == "SUBLEDGER",
+    ).first()
+    if not sl_upload or not sl_upload.file_path:
+        raise HTTPException(status_code=404, detail="No SUBLEDGER file found for this batch.")
+
+    # ── Load SL CSV from Supabase Storage ────────────────────────────────────
+    file_path = sl_upload.file_path
+    supabase_url = settings.SUPABASE_URL.rstrip("/")
+    if file_path.startswith("http://") or file_path.startswith("https://"):
+        full_url = file_path
+    else:
+        full_url = f"{supabase_url}/storage/v1/object/public/File%20Storage/{file_path}"
+
+    try:
+        resp = http_requests.get(full_url, timeout=60)
+        resp.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read SUBLEDGER file: {exc}")
+
+    try:
+        df = pd.read_csv(io.BytesIO(resp.content))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Cannot parse SUBLEDGER CSV: {exc}")
+
+    if df.empty:
+        raise HTTPException(status_code=422, detail="SUBLEDGER CSV is empty.")
+
+    # ── Clean numeric columns ─────────────────────────────────────────────────
+    df.columns = [str(c).strip() for c in df.columns]
+    KEEP_AS_STR = {"Region", "Geo", "Country", "Item type", "Customer", "Order Date"}
+    for col in df.columns:
+        if col in KEEP_AS_STR:
+            continue
+        df[col] = (
+            df[col].astype(str)
+            .str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # ── Merge external factors by year-month ─────────────────────────────────
+    ext_df = load_ext_factors(settings.MODEL_STORE_DIR)
+    ext_cols_merged: List[str] = []
+
+    if ext_df is not None:
+        # Rename Order Date to order_date for merge helper
+        date_col = next((c for c in df.columns if c.lower() in ("order date", "order_date")), None)
+        if date_col:
+            df["order_date"] = pd.to_datetime(df[date_col], errors="coerce")
+            df["year_month"] = df["order_date"].dt.to_period("M")
+            ext_df2 = ext_df.copy()
+            merged = df.merge(ext_df2, on="year_month", how="left")
+            merged.drop(columns=["year_month", "order_date"], inplace=True, errors="ignore")
+            df = merged
+            ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in df.columns]
+
+    # ── Apply user ext factor overrides (for live what-if refresh) ───────────
+    overrides = {
+        k: v for k, v in {
+            "CCI": payload.CCI, "CPI": payload.CPI, "Oil": payload.Oil,
+            "GDP": payload.GDP, "Unemployment": payload.Unemployment, "ROI": payload.ROI,
+        }.items() if v is not None and v != 0
+    }
+    for factor, val in overrides.items():
+        df[factor] = val  # overwrite entire column with the new value
+        if factor not in ext_cols_merged:
+            ext_cols_merged.append(factor)
+
+    # ── Select columns for correlation ────────────────────────────────────────
+    sl_cols_found = [c for c in _SL_NUMERIC_COLS if c in df.columns and df[c].notna().any()]
+    all_cols = sl_cols_found + [c for c in ext_cols_merged if c not in sl_cols_found]
+
+    if len(all_cols) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Need at least 2 numeric columns for correlation. Found: {all_cols}",
+        )
+
+    corr_df = df[all_cols].dropna(how="all")
+    corr = corr_df.corr()
+
+    matrix = [
+        [round(corr.loc[r, c], 4) if not pd.isna(corr.loc[r, c]) else 0.0
+         for c in all_cols]
+        for r in all_cols
+    ]
+
+    return FullHeatmapResponse(
+        columns=all_cols,
+        correlation=matrix,
+        row_count=len(corr_df),
+        sl_columns_found=sl_cols_found,
+        ext_columns_found=ext_cols_merged,
+        message=(
+            f"Correlation matrix computed. {len(sl_cols_found)} SL columns + "
+            f"{len(ext_cols_merged)} ext factors = {len(all_cols)} total features. "
+            + (f"Overrides applied: {list(overrides.keys())}." if overrides else "")
+        ),
+    )
+
+
+# ── External factors vs SL columns cross-correlation heatmap ─────────────────
+# Rows = SL business columns, Columns = external factors
+# Result is a rectangular matrix (11 × 6) showing how macro factors
+# correlate with each business metric in the CSV.
+
+class ExtVsSlHeatmapRequest(BaseModel):
+    batch_id: int = Field(..., description="Batch ID whose SUBLEDGER CSV to use")
+    CCI:          Optional[float] = Field(None, description="Override CCI — leave empty to use stored data")
+    CPI:          Optional[float] = Field(None, description="Override CPI — leave empty to use stored data")
+    Oil:          Optional[float] = Field(None, description="Override Oil — leave empty to use stored data")
+    GDP:          Optional[float] = Field(None, description="Override GDP — leave empty to use stored data")
+    Unemployment: Optional[float] = Field(None, description="Override Unemployment — leave empty to use stored data")
+    ROI:          Optional[float] = Field(None, description="Override ROI — leave empty to use stored data")
+
+
+class ExtVsSlHeatmapResponse(BaseModel):
+    sl_columns: List[str]           # Y axis — SL business columns
+    ext_columns: List[str]          # X axis — external factors
+    correlation: List[List[float]]  # rectangular matrix [sl_col][ext_col]
+    row_count: int
+    message: str
+
+
+@router.post(
+    "/external-factors/{model_id}",
+    response_model=ExtVsSlHeatmapResponse,
+    summary="Cross-correlation: external factors vs SL business columns",
+    description=(
+        "Loads the SUBLEDGER CSV from Supabase Storage for the given batch, "
+        "merges external factors (CCI, CPI, Oil, GDP, Unemployment, ROI) by year-month, "
+        "then computes the Pearson correlation between each external factor and each "
+        "SL business column (Total Revenue, COGS, SG&A, Raw Material, etc.). "
+        "Returns a rectangular matrix — Y axis is SL columns, X axis is external factors. "
+        "Pass optional override values for live what-if analysis."
+    ),
+)
+def external_vs_sl_heatmap(
+    model_id: int,
+    payload: ExtVsSlHeatmapRequest,
+    main_db: Session = Depends(get_main_db),
+    current_user=Depends(get_current_user),
+):
+    # ── Verify batch belongs to company ───────────────────────────────────────
+    batch = main_db.query(IngestionBatch).filter(
+        IngestionBatch.id == payload.batch_id,
+        IngestionBatch.company_id == current_user.company_id,
+    ).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+    sl_upload = main_db.query(FileUpload).filter(
+        FileUpload.batch_id == payload.batch_id,
+        FileUpload.file_type == "SUBLEDGER",
+    ).first()
+    if not sl_upload or not sl_upload.file_path:
+        raise HTTPException(status_code=404, detail="No SUBLEDGER file found for this batch.")
+
+    # ── Load SL CSV from Supabase Storage ────────────────────────────────────
+    file_path = sl_upload.file_path
+    supabase_url = settings.SUPABASE_URL.rstrip("/")
+    full_url = (
+        file_path if file_path.startswith("http")
+        else f"{supabase_url}/storage/v1/object/public/File%20Storage/{file_path}"
+    )
+    try:
+        resp = http_requests.get(full_url, timeout=60)
+        resp.raise_for_status()
+        df = pd.read_csv(io.BytesIO(resp.content))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load SUBLEDGER CSV: {exc}")
+
+    if df.empty:
+        raise HTTPException(status_code=422, detail="SUBLEDGER CSV is empty.")
+
+    # ── Clean numeric columns ─────────────────────────────────────────────────
+    df.columns = [str(c).strip() for c in df.columns]
+    KEEP_AS_STR = {"Region", "Geo", "Country", "Item type", "Customer", "Order Date"}
+    for col in df.columns:
+        if col in KEEP_AS_STR:
+            continue
+        df[col] = (
+            df[col].astype(str)
+            .str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # ── Merge external factors by year-month ─────────────────────────────────
+    ext_df = load_ext_factors(settings.MODEL_STORE_DIR)
+    ext_cols_merged: List[str] = []
+
+    date_col = next((c for c in df.columns if c.lower() in ("order date", "order_date")), None)
+    if ext_df is not None and date_col:
+        df["_order_date"] = pd.to_datetime(df[date_col], errors="coerce")
+        df["year_month"] = df["_order_date"].dt.to_period("M")
+        merged = df.merge(ext_df, on="year_month", how="left")
+        merged.drop(columns=["year_month", "_order_date"], inplace=True, errors="ignore")
+        df = merged
+        ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in df.columns]
+
+    # ── Apply user overrides ──────────────────────────────────────────────────
+    overrides = {
+        k: v for k, v in {
+            "CCI": payload.CCI, "CPI": payload.CPI, "Oil": payload.Oil,
+            "GDP": payload.GDP, "Unemployment": payload.Unemployment, "ROI": payload.ROI,
+        }.items() if v is not None and v != 0
+    }
+    for factor, val in overrides.items():
+        df[factor] = val
+        if factor not in ext_cols_merged:
+            ext_cols_merged.append(factor)
+
+    # ── Pick SL columns and ext columns that actually exist ───────────────────
+    sl_cols = [c for c in _SL_NUMERIC_COLS if c in df.columns and df[c].notna().any()]
+    ext_cols = [c for c in ext_cols_merged if df[c].notna().any()]
+
+    if not sl_cols:
+        raise HTTPException(status_code=422, detail="No SL numeric columns found in CSV.")
+    if not ext_cols:
+        raise HTTPException(status_code=422, detail="No external factor columns found after merge.")
+
+    # ── Compute rectangular cross-correlation matrix ──────────────────────────
+    # corr_df has all columns; we slice rows=sl_cols, cols=ext_cols
+    all_cols = list(dict.fromkeys(sl_cols + ext_cols))  # deduplicated, order preserved
+    full_corr = df[all_cols].corr()
+
+    # matrix[i][j] = correlation between sl_cols[i] and ext_cols[j]
+    matrix = [
+        [round(full_corr.loc[sl, ex], 4) if not pd.isna(full_corr.loc[sl, ex]) else 0.0
+         for ex in ext_cols]
+        for sl in sl_cols
+    ]
+
+    return ExtVsSlHeatmapResponse(
+        sl_columns=sl_cols,
+        ext_columns=ext_cols,
+        correlation=matrix,
+        row_count=len(df),
+        message=(
+            f"Cross-correlation: {len(sl_cols)} SL columns × {len(ext_cols)} external factors. "
+            + (f"Overrides applied: {list(overrides.keys())}." if overrides else "")
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared schemas and helpers for append / replace-latest endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+import datetime as _dt
+
+
+class ExtFactorRowInput(BaseModel):
+    """Ext factor values sent by the user for append or replace-latest."""
+    CCI:          Optional[float] = Field(None, description="Consumer Confidence Index")
+    CPI:          Optional[float] = Field(None, description="Consumer Price Index")
+    Oil:          Optional[float] = Field(None, description="Crude Oil price")
+    GDP:          Optional[float] = Field(None, description="GDP value")
+    Unemployment: Optional[float] = Field(None, description="Unemployment rate")
+    ROI:          Optional[float] = Field(None, description="Return on Investment")
+
+
+class BatchExtFactorRowInput(ExtFactorRowInput):
+    """Same as above but also needs batch_id for SL-based endpoints."""
+    batch_id: int = Field(..., description="Batch ID whose SUBLEDGER CSV to use")
+
+
+def _load_ext_factors_df() -> pd.DataFrame:
+    """Load and parse external_factors.csv into a clean monthly DataFrame."""
+    path = os.path.join(settings.MODEL_STORE_DIR, EXT_FACTORS_FILENAME)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="external_factors.csv not found in model_store.")
+    raw = pd.read_csv(path)
+    date_col = next((c for c in raw.columns if c.lower() in ("order date", "order_date", "date")), None)
+    if date_col is None:
+        raise HTTPException(status_code=422, detail="No date column found in external_factors.csv.")
+    factors_found = [c for c in EXT_FACTOR_COLS if c in raw.columns]
+    df = raw[[date_col] + factors_found].copy()
+    df["date"] = _parse_date_series(df[date_col])
+    df = df.dropna(subset=["date"])
+    df["date"] = df["date"].dt.to_period("M").dt.to_timestamp()
+    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    for f in factors_found:
+        df[f] = pd.to_numeric(df[f].astype(str).str.replace(r"[$,%\s]", "", regex=True), errors="coerce")
+    return df
+
+
+def _load_sl_df_from_batch(batch_id: int, company_id, main_db: Session) -> pd.DataFrame:
+    """Load and clean the SUBLEDGER CSV from Supabase Storage for a given batch."""
+    batch = main_db.query(IngestionBatch).filter(
+        IngestionBatch.id == batch_id,
+        IngestionBatch.company_id == company_id,
+    ).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+    sl_upload = main_db.query(FileUpload).filter(
+        FileUpload.batch_id == batch_id,
+        FileUpload.file_type == "SUBLEDGER",
+    ).first()
+    if not sl_upload or not sl_upload.file_path:
+        raise HTTPException(status_code=404, detail="No SUBLEDGER file found for this batch.")
+    file_path = sl_upload.file_path
+    supabase_url = settings.SUPABASE_URL.rstrip("/")
+    full_url = (
+        file_path if file_path.startswith("http")
+        else f"{supabase_url}/storage/v1/object/public/File%20Storage/{file_path}"
+    )
+    try:
+        resp = http_requests.get(full_url, timeout=60)
+        resp.raise_for_status()
+        df = pd.read_csv(io.BytesIO(resp.content))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load SUBLEDGER CSV: {exc}")
+    df.columns = [str(c).strip() for c in df.columns]
+    KEEP_AS_STR = {"Region", "Geo", "Country", "Item type", "Customer", "Order Date"}
+    for col in df.columns:
+        if col in KEEP_AS_STR:
+            continue
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+    return df
+
+
+def _user_ext_values(payload: ExtFactorRowInput) -> dict:
+    return {
+        k: v for k, v in {
+            "CCI": payload.CCI, "CPI": payload.CPI, "Oil": payload.Oil,
+            "GDP": payload.GDP, "Unemployment": payload.Unemployment, "ROI": payload.ROI,
+        }.items() if v is not None
+    }
+
+
+def _compute_6x6(df: pd.DataFrame, factors: List[str]) -> tuple:
+    corr = df[factors].corr()
+    matrix = [
+        [round(corr.loc[r, c], 4) if not pd.isna(corr.loc[r, c]) else 0.0 for c in factors]
+        for r in factors
+    ]
+    return factors, matrix
+
+
+def _compute_rect(df: pd.DataFrame, sl_cols: List[str], ext_cols: List[str]) -> List[List[float]]:
+    all_cols = list(dict.fromkeys(sl_cols + ext_cols))
+    corr = df[all_cols].corr()
+    return [
+        [round(corr.loc[sl, ex], 4) if not pd.isna(corr.loc[sl, ex]) else 0.0 for ex in ext_cols]
+        for sl in sl_cols
+    ]
+
+
+def _compute_full(df: pd.DataFrame, all_cols: List[str]) -> List[List[float]]:
+    corr = df[all_cols].corr()
+    return [
+        [round(corr.loc[r, c], 4) if not pd.isna(corr.loc[r, c]) else 0.0 for c in all_cols]
+        for r in all_cols
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6×6  —  Option A: append new row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/from-storage/append",
+    response_model=StorageHeatmapResponse,
+    summary="6×6 ext factors — append new monthly row then recompute",
+    description=(
+        "Appends the user-provided ext factor values as a new row (current month) "
+        "to the stored external_factors.csv dataset, then recomputes the 6×6 "
+        "Pearson correlation matrix. The original file is NOT modified — the append "
+        "is in-memory only for this request."
+    ),
+)
+def ext_6x6_append(
+    payload: ExtFactorRowInput,
+    current_user=Depends(get_current_user),
+):
+    df = _load_ext_factors_df()
+    factors = [c for c in EXT_FACTOR_COLS if c in df.columns]
+    user_vals = _user_ext_values(payload)
+    if not user_vals:
+        raise HTTPException(status_code=422, detail="Provide at least one external factor value.")
+
+    # Build new row — current month, fill missing factors with column median
+    new_month = pd.Timestamp(_dt.date.today()).to_period("M").to_timestamp()
+    new_row = {"date": new_month}
+    for f in factors:
+        new_row[f] = user_vals.get(f, df[f].median())
+
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    factors_out, matrix = _compute_6x6(df, factors)
+    df["date"] = df["date"].astype(str)
+    monthly_data = df[["date"] + factors].to_dict(orient="records")
+
+    return StorageHeatmapResponse(
+        factors_found=factors_out,
+        row_count=len(monthly_data),
+        date_range_start=monthly_data[0]["date"] if monthly_data else None,
+        date_range_end=monthly_data[-1]["date"] if monthly_data else None,
+        correlation=CorrelationMatrix(factors=factors_out, matrix=matrix),
+        monthly_data=monthly_data,
+        message=f"New row appended (current month). {len(factors_out)} factors, {len(monthly_data)} months total.",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6×6  —  Option B: replace latest row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/from-storage/replace-latest",
+    response_model=StorageHeatmapResponse,
+    summary="6×6 ext factors — replace latest monthly row then recompute",
+    description=(
+        "Replaces the most recent month's ext factor values with the user-provided "
+        "values, then recomputes the 6×6 Pearson correlation matrix. "
+        "In-memory only — the stored file is not modified."
+    ),
+)
+def ext_6x6_replace_latest(
+    payload: ExtFactorRowInput,
+    current_user=Depends(get_current_user),
+):
+    df = _load_ext_factors_df()
+    factors = [c for c in EXT_FACTOR_COLS if c in df.columns]
+    user_vals = _user_ext_values(payload)
+    if not user_vals:
+        raise HTTPException(status_code=422, detail="Provide at least one external factor value.")
+
+    # Replace only the values the user sent in the latest row
+    for f, v in user_vals.items():
+        if f in df.columns:
+            df.loc[df.index[-1], f] = v
+
+    factors_out, matrix = _compute_6x6(df, factors)
+    df["date"] = df["date"].astype(str)
+    monthly_data = df[["date"] + factors].to_dict(orient="records")
+
+    return StorageHeatmapResponse(
+        factors_found=factors_out,
+        row_count=len(monthly_data),
+        date_range_start=monthly_data[0]["date"] if monthly_data else None,
+        date_range_end=monthly_data[-1]["date"] if monthly_data else None,
+        correlation=CorrelationMatrix(factors=factors_out, matrix=matrix),
+        monthly_data=monthly_data,
+        message=f"Latest row updated. {len(factors_out)} factors, {len(monthly_data)} months total.",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11×6  —  Option A: append new row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/external-factors/append/{model_id}",
+    response_model=ExtVsSlHeatmapResponse,
+    summary="11×6 cross-correlation — append new monthly row then recompute",
+    description=(
+        "Appends the user-provided ext factor values as a new row to the merged dataset. "
+        "SL column values for the new row are filled using the median of historical data. "
+        "Recomputes the 11×6 cross-correlation matrix. In-memory only."
+    ),
+)
+def ext_11x6_append(
+    model_id: int,
+    payload: BatchExtFactorRowInput,
+    main_db: Session = Depends(get_main_db),
+    current_user=Depends(get_current_user),
+):
+    sl_df = _load_sl_df_from_batch(payload.batch_id, current_user.company_id, main_db)
+    ext_df = _load_ext_factors_df()
+    user_vals = _user_ext_values(payload)
+    if not user_vals:
+        raise HTTPException(status_code=422, detail="Provide at least one external factor value.")
+
+    # Merge ext factors into SL data
+    date_col = next((c for c in sl_df.columns if c.lower() in ("order date", "order_date")), None)
+    ext_cols_merged: List[str] = []
+    if date_col and ext_df is not None:
+        sl_df["year_month"] = pd.to_datetime(sl_df[date_col], errors="coerce").dt.to_period("M")
+        ext_df["year_month"] = ext_df["date"].dt.to_period("M")
+        sl_df = sl_df.merge(ext_df.drop(columns=["date"]), on="year_month", how="left")
+        sl_df.drop(columns=["year_month"], inplace=True, errors="ignore")
+        ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in sl_df.columns]
+
+    sl_cols = [c for c in _SL_NUMERIC_COLS if c in sl_df.columns and sl_df[c].notna().any()]
+    ext_cols = [c for c in ext_cols_merged if sl_df[c].notna().any()]
+
+    # Build new row: median SL values + user ext values
+    new_row = {}
+    for c in sl_cols:
+        new_row[c] = sl_df[c].median()
+    for f in ext_cols:
+        new_row[f] = user_vals.get(f, sl_df[f].median())
+
+    all_cols = list(dict.fromkeys(sl_cols + ext_cols))
+    sl_df = pd.concat([sl_df[all_cols], pd.DataFrame([new_row])], ignore_index=True)
+    matrix = _compute_rect(sl_df, sl_cols, ext_cols)
+
+    return ExtVsSlHeatmapResponse(
+        sl_columns=sl_cols,
+        ext_columns=ext_cols,
+        correlation=matrix,
+        row_count=len(sl_df),
+        message=f"New row appended. Cross-correlation: {len(sl_cols)} SL × {len(ext_cols)} ext factors.",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11×6  —  Option B: replace latest row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/external-factors/replace-latest/{model_id}",
+    response_model=ExtVsSlHeatmapResponse,
+    summary="11×6 cross-correlation — replace latest row ext values then recompute",
+    description=(
+        "Replaces the ext factor values of the most recent row in the merged dataset "
+        "with the user-provided values, then recomputes the 11×6 cross-correlation. "
+        "In-memory only."
+    ),
+)
+def ext_11x6_replace_latest(
+    model_id: int,
+    payload: BatchExtFactorRowInput,
+    main_db: Session = Depends(get_main_db),
+    current_user=Depends(get_current_user),
+):
+    sl_df = _load_sl_df_from_batch(payload.batch_id, current_user.company_id, main_db)
+    ext_df = _load_ext_factors_df()
+    user_vals = _user_ext_values(payload)
+    if not user_vals:
+        raise HTTPException(status_code=422, detail="Provide at least one external factor value.")
+
+    date_col = next((c for c in sl_df.columns if c.lower() in ("order date", "order_date")), None)
+    ext_cols_merged: List[str] = []
+    if date_col and ext_df is not None:
+        sl_df["year_month"] = pd.to_datetime(sl_df[date_col], errors="coerce").dt.to_period("M")
+        sl_df = sl_df.merge(ext_df, on="year_month", how="left")
+        sl_df.drop(columns=["year_month"], inplace=True, errors="ignore")
+        ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in sl_df.columns]
+
+    sl_cols = [c for c in _SL_NUMERIC_COLS if c in sl_df.columns and sl_df[c].notna().any()]
+    ext_cols = [c for c in ext_cols_merged if sl_df[c].notna().any()]
+
+    # Replace ext factor values in the last row only
+    for f, v in user_vals.items():
+        if f in sl_df.columns:
+            sl_df.loc[sl_df.index[-1], f] = v
+
+    matrix = _compute_rect(sl_df, sl_cols, ext_cols)
+
+    return ExtVsSlHeatmapResponse(
+        sl_columns=sl_cols,
+        ext_columns=ext_cols,
+        correlation=matrix,
+        row_count=len(sl_df),
+        message=f"Latest row updated. Cross-correlation: {len(sl_cols)} SL × {len(ext_cols)} ext factors.",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17×17  —  Option A: append new row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/full-dataset/append/{model_id}",
+    response_model=FullHeatmapResponse,
+    summary="17×17 full heatmap — append new monthly row then recompute",
+    description=(
+        "Appends the user-provided ext factor values as a new row to the merged dataset. "
+        "SL column values for the new row are filled with historical medians. "
+        "Recomputes the full N×N correlation matrix. In-memory only."
+    ),
+)
+def full_17x17_append(
+    model_id: int,
+    payload: BatchExtFactorRowInput,
+    main_db: Session = Depends(get_main_db),
+    current_user=Depends(get_current_user),
+):
+    sl_df = _load_sl_df_from_batch(payload.batch_id, current_user.company_id, main_db)
+    ext_df = _load_ext_factors_df()
+    user_vals = _user_ext_values(payload)
+    if not user_vals:
+        raise HTTPException(status_code=422, detail="Provide at least one external factor value.")
+
+    date_col = next((c for c in sl_df.columns if c.lower() in ("order date", "order_date")), None)
+    ext_cols_merged: List[str] = []
+    if date_col and ext_df is not None:
+        sl_df["year_month"] = pd.to_datetime(sl_df[date_col], errors="coerce").dt.to_period("M")
+        sl_df = sl_df.merge(ext_df, on="year_month", how="left")
+        sl_df.drop(columns=["year_month"], inplace=True, errors="ignore")
+        ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in sl_df.columns]
+
+    sl_cols = [c for c in _SL_NUMERIC_COLS if c in sl_df.columns and sl_df[c].notna().any()]
+    ext_cols = [c for c in ext_cols_merged if sl_df[c].notna().any()]
+    all_cols = list(dict.fromkeys(sl_cols + ext_cols))
+
+    # Build new row: median SL + user ext values
+    new_row = {}
+    for c in sl_cols:
+        new_row[c] = sl_df[c].median()
+    for f in ext_cols:
+        new_row[f] = user_vals.get(f, sl_df[f].median())
+
+    sl_df = pd.concat([sl_df[all_cols], pd.DataFrame([new_row])], ignore_index=True)
+    matrix = _compute_full(sl_df, all_cols)
+
+    return FullHeatmapResponse(
+        columns=all_cols,
+        correlation=matrix,
+        row_count=len(sl_df),
+        sl_columns_found=sl_cols,
+        ext_columns_found=ext_cols,
+        message=f"New row appended. Full matrix: {len(all_cols)} features.",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17×17  —  Option B: replace latest row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/full-dataset/replace-latest/{model_id}",
+    response_model=FullHeatmapResponse,
+    summary="17×17 full heatmap — replace latest row ext values then recompute",
+    description=(
+        "Replaces the ext factor values of the most recent row in the merged dataset "
+        "with the user-provided values, then recomputes the full N×N correlation matrix. "
+        "In-memory only."
+    ),
+)
+def full_17x17_replace_latest(
+    model_id: int,
+    payload: BatchExtFactorRowInput,
+    main_db: Session = Depends(get_main_db),
+    current_user=Depends(get_current_user),
+):
+    sl_df = _load_sl_df_from_batch(payload.batch_id, current_user.company_id, main_db)
+    ext_df = _load_ext_factors_df()
+    user_vals = _user_ext_values(payload)
+    if not user_vals:
+        raise HTTPException(status_code=422, detail="Provide at least one external factor value.")
+
+    date_col = next((c for c in sl_df.columns if c.lower() in ("order date", "order_date")), None)
+    ext_cols_merged: List[str] = []
+    if date_col and ext_df is not None:
+        sl_df["year_month"] = pd.to_datetime(sl_df[date_col], errors="coerce").dt.to_period("M")
+        sl_df = sl_df.merge(ext_df, on="year_month", how="left")
+        sl_df.drop(columns=["year_month"], inplace=True, errors="ignore")
+        ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in sl_df.columns]
+
+    sl_cols = [c for c in _SL_NUMERIC_COLS if c in sl_df.columns and sl_df[c].notna().any()]
+    ext_cols = [c for c in ext_cols_merged if sl_df[c].notna().any()]
+    all_cols = list(dict.fromkeys(sl_cols + ext_cols))
+
+    # Replace ext factor values in last row only
+    for f, v in user_vals.items():
+        if f in sl_df.columns:
+            sl_df.loc[sl_df.index[-1], f] = v
+
+    matrix = _compute_full(sl_df, all_cols)
+
+    return FullHeatmapResponse(
+        columns=all_cols,
+        correlation=matrix,
+        row_count=len(sl_df),
+        sl_columns_found=sl_cols,
+        ext_columns_found=ext_cols,
+        message=f"Latest row updated. Full matrix: {len(all_cols)} features.",
     )
